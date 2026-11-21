@@ -1,9 +1,11 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
+using System.Windows.Automation;
 using System.Windows.Forms;
 
 internal sealed class WebcamPreview : Form
@@ -12,6 +14,9 @@ internal sealed class WebcamPreview : Form
     private readonly string preferredCamera;
     private readonly Timer refreshTimer = new Timer { Interval = 30 };
     private readonly Timer verificationTimer = new Timer { Interval = 1000 };
+    private readonly Timer gamepadTimer = new Timer { Interval = 15 };
+    private readonly bool[] gamepadConnected = new bool[Gamepad.SlotCount];
+    private readonly GamepadButtons[] previousButtons = new GamepadButtons[Gamepad.SlotCount];
     private readonly ImageAttributes invertedColors = CreateInversion();
     private readonly ToolStripMenuItem inversion = new ToolStripMenuItem("Invert colors") {
         Checked = true, CheckOnClick = true
@@ -24,7 +29,16 @@ internal sealed class WebcamPreview : Form
     private FrameBuffer frames;
     private Bitmap bitmap;
     private int renderedFrames;
+    private int captureRestarts;
+    private IntPtr selectedChrome;
+    private Rectangle windowedBounds;
+    private bool webcamFullscreen;
+    private bool handlingGamepad;
+    private readonly Queue<string> gamepadActions = new Queue<string>();
+    private string gamepadStatus = "Webcam selected";
+    private Label captureError;
     private ISampleGrabber grabber;
+    private IBaseFilter sink;
     private IMediaControl control;
     private object graph;
     private ICaptureGraphBuilder builder;
@@ -52,6 +66,7 @@ internal sealed class WebcamPreview : Form
         Controls.Add(videoPanel);
         var menu = new ContextMenuStrip();
         menu.Items.Add(inversion);
+        menu.Items.Add("Relaunch webcam capture", null, delegate { RestartCapture(); });
         menu.Items.Add("Close preview", null, delegate { Close(); });
         videoPanel.ContextMenuStrip = menu;
         inversion.CheckedChanged += delegate { videoPanel.Invalidate(); };
@@ -63,11 +78,177 @@ internal sealed class WebcamPreview : Form
                 videoPanel.Capture = false;
         };
         refreshTimer.Tick += RefreshPreview;
+        gamepadTimer.Tick += PollGamepads;
     }
 
     protected override void OnShown(EventArgs args)
     {
         base.OnShown(args);
+        StartCapture();
+        gamepadTimer.Start();
+    }
+
+    private void PollGamepads(object sender, EventArgs args)
+    {
+        if (handlingGamepad)
+            return;
+
+        GamepadButtons pressed = GamepadButtons.None;
+        for (int slot = 0; slot < Gamepad.SlotCount; slot++)
+        {
+            GamepadButtons current;
+            bool connected = Gamepad.TryRead(slot, out current);
+            if (connected && gamepadConnected[slot])
+                pressed |= current & ~previousButtons[slot];
+            gamepadConnected[slot] = connected;
+            previousButtons[slot] = current;
+        }
+        HandleGamepadButtons(pressed);
+    }
+
+    private void HandleGamepadButtons(GamepadButtons pressed)
+    {
+        if (pressed == GamepadButtons.None || handlingGamepad)
+            return;
+
+        handlingGamepad = true;
+        try
+        {
+            if ((pressed & GamepadButtons.B) != 0)
+            {
+                RestartCapture();
+                RecordGamepadAction("B: webcam capture restarted", false);
+            }
+            if ((pressed & GamepadButtons.A) != 0)
+                ToggleFullscreen();
+            bool previous = (pressed & (GamepadButtons.LeftShoulder | GamepadButtons.LeftTrigger)) != 0;
+            bool next = (pressed & (GamepadButtons.RightShoulder | GamepadButtons.RightTrigger)) != 0;
+            if (previous != next)
+                CycleTarget(next ? 1 : -1);
+        }
+        finally
+        {
+            handlingGamepad = false;
+        }
+    }
+
+    private void ToggleFullscreen()
+    {
+        if (!ChromeWindows.IsBrowserWindow(selectedChrome))
+        {
+            ShowWebcam(!webcamFullscreen);
+            return;
+        }
+
+        bool fullscreen = !ChromeWindows.IsFullscreen(selectedChrome);
+        TopMost = !fullscreen;
+        bool changed = ChromeWindows.SetFullscreen(selectedChrome, fullscreen);
+        TopMost = !ChromeWindows.IsFullscreen(selectedChrome);
+        RecordGamepadAction(changed ? (fullscreen ? "Chrome fullscreen" : "Chrome restored") :
+            "Chrome did not change fullscreen mode");
+    }
+
+    private void CycleTarget(int direction)
+    {
+        bool fromChrome = ChromeWindows.IsBrowserWindow(selectedChrome);
+        bool fullscreen = fromChrome ? ChromeWindows.IsFullscreen(selectedChrome) : webcamFullscreen;
+        if (fromChrome && fullscreen && !ChromeWindows.SetFullscreen(selectedChrome, false))
+        {
+            RecordGamepadAction("Chrome did not exit fullscreen");
+            return;
+        }
+
+        try
+        {
+            var tabs = ChromeWindows.GetTabs();
+            int index = 0; // The webcam precedes the Chrome tabs.
+            if (fromChrome)
+            {
+                int active = tabs.FindIndex(tab => tab.Window == selectedChrome &&
+                    (tab.Selection == null || tab.Selection.Current.IsSelected));
+                if (active >= 0)
+                    index = active + 1;
+            }
+            int target = (index + direction + tabs.Count + 1) % (tabs.Count + 1);
+            if (target == 0)
+            {
+                ShowWebcam(fullscreen);
+                return;
+            }
+
+            ChromeTab tabTarget = tabs[target - 1];
+            SetWebcamFullscreen(false);
+            selectedChrome = tabTarget.Window;
+            TopMost = false;
+            ChromeWindows.Focus(selectedChrome);
+            if (tabTarget.Selection != null && !tabTarget.Selection.Current.IsSelected)
+                tabTarget.Selection.Select();
+            bool changed = !fullscreen || ChromeWindows.SetFullscreen(selectedChrome, true);
+            TopMost = !ChromeWindows.IsFullscreen(selectedChrome);
+            RecordGamepadAction(changed ? "Chrome tab " + target + (fullscreen ? " fullscreen" : " selected") :
+                "Chrome tab selected but fullscreen did not change");
+        }
+        catch (ElementNotAvailableException)
+        {
+            ShowWebcam(fullscreen);
+        }
+        catch (InvalidOperationException)
+        {
+            ShowWebcam(fullscreen);
+        }
+        catch (COMException)
+        {
+            ShowWebcam(fullscreen);
+        }
+    }
+
+    private void ShowWebcam(bool fullscreen)
+    {
+        selectedChrome = IntPtr.Zero;
+        TopMost = true;
+        SetWebcamFullscreen(fullscreen);
+        ChromeWindows.Focus(Handle);
+        BringToFront();
+        RecordGamepadAction(fullscreen ? "Webcam fullscreen" : "Webcam selected");
+    }
+
+    private void RecordGamepadAction(string action, bool changesTarget = true)
+    {
+        if (changesTarget)
+            gamepadStatus = action;
+        if (gamepadActions.Count == 12)
+            gamepadActions.Dequeue();
+        gamepadActions.Enqueue(action);
+    }
+
+    private void SetWebcamFullscreen(bool fullscreen)
+    {
+        if (webcamFullscreen == fullscreen)
+            return;
+        webcamFullscreen = fullscreen;
+        if (fullscreen)
+        {
+            windowedBounds = Bounds;
+            Bounds = Screen.FromControl(this).Bounds;
+        }
+        else
+            Bounds = windowedBounds;
+    }
+
+    private void RestartCapture()
+    {
+        captureRestarts++;
+        StopCapture();
+        StartCapture();
+    }
+
+    private void StartCapture()
+    {
+        if (captureError != null)
+        {
+            captureError.Dispose();
+            captureError = null;
+        }
         object selected = null;
         string selectedName = null;
         string targetCamera = preferredCamera ?? "USB Video";
@@ -138,14 +319,16 @@ internal sealed class WebcamPreview : Form
         }
         catch (Exception error)
         {
+            StopCapture();
             Text = "Webcam Preview | Camera unavailable";
             Log(stage + ": " + error);
-            videoPanel.Controls.Add(new Label {
+            captureError = new Label {
                 Dock = DockStyle.Fill, ForeColor = Color.White,
                 ContextMenuStrip = videoPanel.ContextMenuStrip,
                 TextAlign = ContentAlignment.MiddleCenter,
                 Text = "Could not open " + (selectedName ?? "a webcam") + "." + Environment.NewLine + error.Message
-            });
+            };
+            videoPanel.Controls.Add(captureError);
         }
     }
 
@@ -198,6 +381,7 @@ internal sealed class WebcamPreview : Form
         finally
         {
             Marshal.FreeCoTaskMem(capabilities);
+            Marshal.ReleaseComObject(config);
         }
     }
 
@@ -205,8 +389,8 @@ internal sealed class WebcamPreview : Form
     {
         var filterGraph = (IFilterGraph)graph;
         var sampleFilter = (IBaseFilter)Create("C1F400A0-3F08-11D3-9F0B-006008039E37");
-        var sink = (IBaseFilter)Create("C1F400A4-3F08-11D3-9F0B-006008039E37");
         grabber = (ISampleGrabber)sampleFilter;
+        sink = (IBaseFilter)Create("C1F400A4-3F08-11D3-9F0B-006008039E37");
         var videoType = new AMMediaType {
             MajorType = media,
             Subtype = new Guid("E436EB7D-524F-11CE-9F53-0020AF0BA770"),
@@ -252,7 +436,7 @@ internal sealed class WebcamPreview : Form
 
     private void PreviewMouseDown(object sender, MouseEventArgs args)
     {
-        if (args.Button != MouseButtons.Left)
+        if (args.Button != MouseButtons.Left || webcamFullscreen)
             return;
 
         dragStart = MousePosition;
@@ -263,6 +447,11 @@ internal sealed class WebcamPreview : Form
 
     private void PreviewMouseMove(object sender, MouseEventArgs args)
     {
+        if (webcamFullscreen)
+        {
+            videoPanel.Cursor = Cursors.Default;
+            return;
+        }
         if (videoPanel.Capture && (args.Button & MouseButtons.Left) != 0)
         {
             Point cursor = MousePosition;
@@ -362,6 +551,9 @@ internal sealed class WebcamPreview : Form
     {
         Log("Device: " + activeCamera + Environment.NewLine
             + "Capture mode: " + captureMode + Environment.NewLine
+            + "Capture relaunches: " + captureRestarts + Environment.NewLine
+            + "Gamepad target: " + gamepadStatus + Environment.NewLine
+            + "Recent gamepad actions: " + string.Join(" | ", gamepadActions) + Environment.NewLine
             + "Frames rendered: " + renderedFrames + Environment.NewLine
             + "Video visible: " + (renderedFrames > 0 && videoPanel.Visible) + Environment.NewLine
             + "Always on top: " + TopMost + Environment.NewLine
@@ -381,16 +573,46 @@ internal sealed class WebcamPreview : Form
 
     protected override void OnFormClosed(FormClosedEventArgs args)
     {
+        gamepadTimer.Dispose();
+        StopCapture();
         refreshTimer.Dispose();
         verificationTimer.Dispose();
+        invertedColors.Dispose();
+        base.OnFormClosed(args);
+    }
+
+    private void StopCapture()
+    {
+        refreshTimer.Stop();
+        verificationTimer.Stop();
         if (control != null)
             control.Stop();
         if (grabber != null)
             grabber.SetCallback(null, 1);
+        control = null;
+        ReleaseCom(builder);
+        ReleaseCom(graph);
+        ReleaseCom(source);
+        ReleaseCom(grabber);
+        ReleaseCom(sink);
+        builder = null;
+        graph = null;
+        source = null;
+        grabber = null;
+        sink = null;
         if (bitmap != null)
             bitmap.Dispose();
-        invertedColors.Dispose();
-        base.OnFormClosed(args);
+        bitmap = null;
+        frames = null;
+        renderedFrames = 0;
+        captureMode = null;
+        videoPanel.Invalidate();
+    }
+
+    private static void ReleaseCom(object instance)
+    {
+        if (instance != null)
+            Marshal.FinalReleaseComObject(instance);
     }
 
     private static object Create(string id)

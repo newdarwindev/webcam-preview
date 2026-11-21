@@ -15,6 +15,12 @@ Requires 64-bit Windows 10 or 11 and a Windows-compatible camera or capture devi
 - Right-click to toggle **Invert colors** or close the preview. Inversion is enabled when the app opens.
 - The viewer prefers a device named **USB Video** and otherwise uses the first available camera. To specify a different camera, add its exact Windows device name in quotes to the shortcut's target arguments.
 
+### Gamepad
+
+With an XInput-compatible controller, press **A** to toggle fullscreen for the selected webcam or Chrome tab. Use **LB/RB** to move backward or forward through the webcam and open Chrome tabs. **LT/RT** also cycle. Fullscreen follows the selection. Press **B** to restart the camera capture.
+
+Run `powershell -File scripts/test-gamepad.ps1` to log controller button presses and releases for a live input test.
+
 ## Build from source
 
 Run `powershell -File scripts/build.ps1` to build the viewer and self-contained installer in `dist`. Run `powershell -File scripts/install.ps1` to build and install in one step.

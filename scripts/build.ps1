@@ -12,7 +12,11 @@ if (!(Test-Path -LiteralPath $compiler)) {
 }
 
 New-Item -ItemType Directory -Path $output -Force | Out-Null
-& $compiler /nologo /target:winexe /platform:x64 /optimize+ "/out:$preview" /reference:System.Drawing.dll /reference:System.Windows.Forms.dll (Join-Path $source 'WebcamPreview.cs')
+$viewerSources = @('WebcamPreview.cs', 'Gamepad.cs', 'ChromeWindows.cs') | ForEach-Object { Join-Path $source $_ }
+$wpf = Join-Path (Split-Path -Parent $compiler) 'WPF'
+$automationReferences = @('UIAutomationClient.dll', 'UIAutomationTypes.dll', 'WindowsBase.dll') |
+    ForEach-Object { "/reference:$(Join-Path $wpf $_)" }
+& $compiler /nologo /target:winexe /platform:x64 /optimize+ "/out:$preview" /reference:System.Drawing.dll /reference:System.Windows.Forms.dll $automationReferences $viewerSources
 if ($LASTEXITCODE -ne 0) { throw 'Webcam Preview compilation failed.' }
 
 & $compiler /nologo /target:winexe /platform:x64 /optimize+ "/out:$installer" "/resource:$preview,WebcamPreview.exe" /reference:System.Windows.Forms.dll /reference:Microsoft.CSharp.dll (Join-Path $source 'Installer.cs')
